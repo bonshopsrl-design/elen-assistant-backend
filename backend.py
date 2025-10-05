@@ -70,8 +70,46 @@ class OrderCreateIn(BaseModel):
 # ============== Price Lookup (enhanced) ==============
 @app.post("/price.lookup")
 def price_lookup(body: PriceLookupIn):
-    q = (body.query or "").strip()
+    import re
+
+    # 1) 原始查询
+    q_raw = (body.query or "").strip()
     limit = body.limit or 5
+
+    # 2) 生成一组“更干净”的候选查询词
+    #   - 去引号/书名号/奇怪的标点
+    #   - 只保留字母数字和常见的拉丁扩展字母（含重音），空格与连字符
+    def normalize(s: str) -> str:
+        s = s.strip()
+        # 去常见引号
+        s = s.replace("“", "").replace("”", "").replace("‘", "").replace("’", "")
+        s = s.replace('"', "").replace("'", "")
+        # 非字母数字/空格/连字符去掉（保留拉丁扩展 À-ÿ）
+        s = re.sub(r"[^0-9A-Za-zÀ-ÿ\s\-]", " ", s)
+        # 多空格压成一个
+        s = re.sub(r"\s+", " ", s)
+        return s.strip()
+
+    candidates = []
+    if q_raw:
+        candidates.append(q_raw)                 # 原始
+        candidates.append(normalize(q_raw))      # 清洗后
+        # 只取前2~3个词的组合再试一次（防止用户带长描述）
+        parts = normalize(q_raw).split()
+        if len(parts) >= 2:
+            candidates.append(" ".join(parts[:2]))
+        if len(parts) >= 3:
+            candidates.append(" ".join(parts[:3]))
+
+    # 去重并小写化
+    cand_list = []
+    seen_str = set()
+    for c in candidates:
+        c2 = c.lower()
+        if c2 and c2 not in seen_str:
+            seen_str.add(c2)
+            cand_list.append(c2)
+
     items: List[Dict[str, Any]] = []
     seen: set[int] = set()
 
@@ -93,65 +131,16 @@ def price_lookup(body: PriceLookupIn):
             "url": f"{PUBLIC_STORE_URL}/products/{p.get('handle','')}" if PUBLIC_STORE_URL else None
         })
 
-    # 0) variant_id lookup
-    if q.isdigit():
+    # ===== 0) variant_id 直查（保留原逻辑）
+    if q_raw.isdigit():
         try:
-            v = shopify_request(f"/variants/{q}.json").get("variant")
+            v = shopify_request(f"/variants/{q_raw}.json").get("variant")
             if v:
                 p = shopify_request(f"/products/{v['product_id']}.json").get("product", {})
                 push_item(p, v)
         except Exception:
             pass
         if len(items) >= limit:
-            return {"items": items[:limit]}
-
-    # 1) exact SKU
-    try:
-        vjson = shopify_request("/variants.json", params={"sku": q, "limit": 50})
-        for v in vjson.get("variants", []):
-            p = shopify_request(f"/products/{v['product_id']}.json").get("product", {})
-            push_item(p, v)
-            if len(items) >= limit:
-                return {"items": items[:limit]}
-    except Exception:
-        pass
-
-    # 2) title fuzzy
-    if q:
-        try:
-            by_title = shopify_request("/products.json", params={"title": q, "limit": 50}).get("products", [])
-            for p in by_title:
-                v = p["variants"][0]
-                push_item(p, v)
-                if len(items) >= limit:
-                    return {"items": items[:limit]}
-        except Exception:
-            pass
-
-    # 3) fallback contains (title/sku)
-    try:
-        products = shopify_request("/products.json", params={"limit": 250}).get("products", [])
-        qlow = q.lower()
-        for p in products:
-            title = (p.get("title") or "").lower()
-            hit = (qlow in title) if q else False
-            chosen = None
-            for v in p.get("variants", []):
-                sku = (v.get("sku") or "").lower()
-                if q and (qlow in sku):
-                    chosen = v
-                    hit = True
-                    break
-            if hit:
-                v = chosen or p["variants"][0]
-                push_item(p, v)
-                if len(items) >= limit:
-                    break
-    except Exception:
-        pass
-
-    return {"items": items[:limit]}
-
 # ============== Order Create ==============
 @app.post("/order.create")
 def order_create(body: OrderCreateIn):
