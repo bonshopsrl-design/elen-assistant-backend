@@ -241,10 +241,6 @@ def assistant_chat(body: ChatIn):
         # 1) create thread
         thread = client.beta.threads.create()
 
-        # 2) ONLY user message (no system role!)
-        client.beta.threads.messages.create(
-            thread_id=thread.id, role="user", content=body.message
-        )
 
         # 3) run with instructions (= system prompt)
         run = client.beta.threads.runs.create(
