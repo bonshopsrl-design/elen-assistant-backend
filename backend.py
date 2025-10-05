@@ -215,8 +215,9 @@ Sei l'assistente clienti di ELEN MODA. Regole:
 - Per creare ordini servono: nome, telefono, email (se disponibile), indirizzo completo, metodo di pagamento (prepagato/COD), e la lista prodotti (variant_id/sku + quantità).
 - COD solo in Italia, limite importo €150 (se oltre, proponi prepagato).
 - Ricapitola e chiedi conferma 'Sì/No' prima di creare l'ordine.
-- Dopo ordine: mostra numero ordine e tempistiche; tracking arriverà via email dopo la spedizione.
+- Dopo ordine: mostra numero ordine e tempistiche; il tracking arriva via email dopo la spedizione.
 - Se l'utente chiede solo “quanto costa…”, usa lookup_price e rispondi con prezzo, disponibilità, e link prodotto.
+- Se ci sono più risultati, elenca i migliori (max 3) con puntini elenco.
 """
 
 class ChatIn(BaseModel):
@@ -248,22 +249,19 @@ def assistant_chat(body: ChatIn):
         # 1) 新建线程
         thread = client.beta.threads.create()
 
-        # 2) 系统提示（也可放 Assistant 的 Instructions 中）
-        client.beta.threads.messages.create(
-            thread_id=thread.id, role="system", content=SYSTEM_PROMPT
-        )
-
-        # 3) 用户消息
+        # 2) 用户消息（注意不再发送 role='system'）
         client.beta.threads.messages.create(
             thread_id=thread.id, role="user", content=body.message
         )
 
-        # 4) 运行
+        # 3) 运行（把系统提示放在 instructions）
         run = client.beta.threads.runs.create(
-            thread_id=thread.id, assistant_id=ASSISTANT_ID
+            thread_id=thread.id,
+            assistant_id=ASSISTANT_ID,
+            instructions=SYSTEM_PROMPT
         )
 
-        # 5) 处理工具调用
+        # 4) 处理工具调用
         while True:
             run = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
             if run.status == "requires_action":
@@ -282,7 +280,7 @@ def assistant_chat(body: ChatIn):
             else:
                 break
 
-        # 6) 取最终回复
+        # 5) 取最终回复
         msgs = client.beta.threads.messages.list(thread_id=thread.id)
         reply_text = ""
         for m in reversed(msgs.data):
