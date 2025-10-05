@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-# ============== 环境变量 ==============
+# ============== ENV ==============
 load_dotenv()
 SHOP_URL = os.getenv("SHOP_URL")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
@@ -18,16 +18,12 @@ PUBLIC_STORE_URL = (os.getenv("PUBLIC_STORE_URL") or "").rstrip("/")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ASSISTANT_ID = os.getenv("ASSISTANT_ID")
-OPENAI_PROJECT = os.getenv("OPENAI_PROJECT")  # 可选
+OPENAI_PROJECT = os.getenv("OPENAI_PROJECT")  # optional
 
-# ============== App ==============
 app = FastAPI(title="ELEN Assistant Backend", version="1.0.0")
 
-# ============== Shopify 基础封装 ==============
+# ============== Shopify helper ==============
 def shopify_request(path: str, method: str = "GET", payload=None, params=None):
-    """
-    对 Shopify Admin REST 发起请求；出错直接抛 HTTPException 给 FastAPI。
-    """
     url = f"https://{SHOP_URL}/admin/api/2025-10{path}"
     headers = {
         "X-Shopify-Access-Token": ACCESS_TOKEN,
@@ -38,7 +34,7 @@ def shopify_request(path: str, method: str = "GET", payload=None, params=None):
         raise HTTPException(status_code=r.status_code, detail=r.text)
     return r.json()
 
-# ============== 数据模型 ==============
+# ============== Models ==============
 class PriceLookupIn(BaseModel):
     query: str
     limit: int | None = 5
@@ -71,16 +67,9 @@ class OrderCreateIn(BaseModel):
     lines: List[LineItem]
     notes: str | None = "ordine creato dal BOT"
 
-# ============== 查价（增强版） ==============
+# ============== Price Lookup (enhanced) ==============
 @app.post("/price.lookup")
 def price_lookup(body: PriceLookupIn):
-    """
-    更强大的查价：
-    0) 纯数字：当作 variant_id 直查
-    1) /variants.json?sku= 精确 SKU
-    2) /products.json?title= 标题模糊
-    3) /products.json 兜底：title 或 SKU 包含
-    """
     q = (body.query or "").strip()
     limit = body.limit or 5
     items: List[Dict[str, Any]] = []
@@ -104,7 +93,7 @@ def price_lookup(body: PriceLookupIn):
             "url": f"{PUBLIC_STORE_URL}/products/{p.get('handle','')}" if PUBLIC_STORE_URL else None
         })
 
-    # 0) variant_id 直查
+    # 0) variant_id lookup
     if q.isdigit():
         try:
             v = shopify_request(f"/variants/{q}.json").get("variant")
@@ -116,7 +105,7 @@ def price_lookup(body: PriceLookupIn):
         if len(items) >= limit:
             return {"items": items[:limit]}
 
-    # 1) 精确 SKU
+    # 1) exact SKU
     try:
         vjson = shopify_request("/variants.json", params={"sku": q, "limit": 50})
         for v in vjson.get("variants", []):
@@ -127,7 +116,7 @@ def price_lookup(body: PriceLookupIn):
     except Exception:
         pass
 
-    # 2) 标题模糊
+    # 2) title fuzzy
     if q:
         try:
             by_title = shopify_request("/products.json", params={"title": q, "limit": 50}).get("products", [])
@@ -139,7 +128,7 @@ def price_lookup(body: PriceLookupIn):
         except Exception:
             pass
 
-    # 3) 兜底包含（title / sku）
+    # 3) fallback contains (title/sku)
     try:
         products = shopify_request("/products.json", params={"limit": 250}).get("products", [])
         qlow = q.lower()
@@ -163,7 +152,7 @@ def price_lookup(body: PriceLookupIn):
 
     return {"items": items[:limit]}
 
-# ============== 下单 ==============
+# ============== Order Create ==============
 @app.post("/order.create")
 def order_create(body: OrderCreateIn):
     payload = {
@@ -179,7 +168,7 @@ def order_create(body: OrderCreateIn):
         }
     }
     if body.payment_method == "prepaid":
-        payload["order"]["financial_status"] = "pending"  # 预授权/待支付
+        payload["order"]["financial_status"] = "pending"
 
     data = shopify_request("/orders.json", method="POST", payload=payload)
     order = data.get("order", {})
@@ -190,7 +179,7 @@ def order_create(body: OrderCreateIn):
         "currency": order.get("currency")
     }
 
-# ============== 调试端点：窥视部分商品（方便找关键词/sku） ==============
+# ============== Peek products (debug) ==============
 @app.get("/products.peek")
 def products_peek(limit: int = 30):
     js = shopify_request("/products.json", params={"limit": min(250, max(1, limit))})
@@ -207,7 +196,7 @@ def products_peek(limit: int = 30):
         })
     return {"products": out}
 
-# ============== Assistants 桥接（懒加载 OpenAI 客户端） ==============
+# ============== Assistant Bridge ==============
 SYSTEM_PROMPT = """
 Sei l'assistente clienti di ELEN MODA. Regole:
 - Prezzi e disponibilità vanno sempre presi dal backend (funzione lookup_price).
@@ -231,12 +220,15 @@ def call_internal_tool(name: str, args: dict):
         return order_create(OrderCreateIn(**args))
     return {"error": f"unknown tool {name}"}
 
-# 懒加载 OpenAI 客户端，避免环境变量未注入时初始化失败
 from openai import OpenAI
 def get_openai_client() -> OpenAI:
     if not OPENAI_API_KEY:
         raise HTTPException(500, "OPENAI_API_KEY not configured")
     return OpenAI(api_key=OPENAI_API_KEY, project=OPENAI_PROJECT) if OPENAI_PROJECT else OpenAI(api_key=OPENAI_API_KEY)
+
+@app.get("/__version")
+def version():
+    return {"ok": True, "hint": "no system role", "ts": time.time()}
 
 @app.post("/assistant/chat")
 def assistant_chat(body: ChatIn):
@@ -246,22 +238,22 @@ def assistant_chat(body: ChatIn):
 
         client = get_openai_client()
 
-        # 1) 新建线程
+        # 1) create thread
         thread = client.beta.threads.create()
 
-        # 2) 用户消息（注意不再发送 role='system'）
+        # 2) ONLY user message (no system role!)
         client.beta.threads.messages.create(
             thread_id=thread.id, role="user", content=body.message
         )
 
-        # 3) 运行（把系统提示放在 instructions）
+        # 3) run with instructions (= system prompt)
         run = client.beta.threads.runs.create(
             thread_id=thread.id,
             assistant_id=ASSISTANT_ID,
             instructions=SYSTEM_PROMPT
         )
 
-        # 4) 处理工具调用
+        # 4) tool loop
         while True:
             run = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
             if run.status == "requires_action":
@@ -280,7 +272,7 @@ def assistant_chat(body: ChatIn):
             else:
                 break
 
-        # 5) 取最终回复
+        # 5) final reply
         msgs = client.beta.threads.messages.list(thread_id=thread.id)
         reply_text = ""
         for m in reversed(msgs.data):
