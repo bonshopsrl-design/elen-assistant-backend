@@ -37,110 +37,100 @@ def shopify_request(path: str, method: str = "GET", payload=None, params=None):
         raise HTTPException(status_code=r.status_code, detail=r.text)
     return r.json()
 
-
-# ============== Models ==============
-class PriceLookupIn(BaseModel):
-    query: str
-    limit: int | None = 5
-
-
-class LineItem(BaseModel):
-    variant_id: int
-    quantity: int
-
-
-class Address(BaseModel):
-    first_name: str
-    last_name: str | None = None
-    country: str = "IT"
-    province: str | None = None
-    city: str
-    address1: str
-    address2: str | None = None
-    postal_code: str
-
-
-class Customer(BaseModel):
-    email: str | None = None
-    name: str | None = None
-    phone: str | None = None
-
-
-class OrderCreateIn(BaseModel):
-    channel: str | None = "bot"
-    currency: str | None = "EUR"
-    payment_method: str
-    customer: Customer | None = None
-    shipping_address: Address
-    lines: List[LineItem]
-    notes: str | None = "ordine creato dal BOT"
-
-
-# ============== Price Lookup (enhanced) ==============
+# ============== Price Lookup (paginated + smart prefixes) ==============
 @app.post("/price.lookup")
 def price_lookup(body: PriceLookupIn):
     import re
+    from math import inf
 
     q_raw = (body.query or "").strip()
     limit = max(1, min(20, body.limit or 5))
 
+    # —— 扫描配置：一次最多扫 PAGE_SIZE 条，最多扫 MAX_PAGES 页（总量 ~= PAGE_SIZE * MAX_PAGES）
+    PAGE_SIZE = int(os.getenv("LOOKUP_PAGE_SIZE", "250"))     # Shopify 允许到 250
+    MAX_PAGES = int(os.getenv("LOOKUP_MAX_PAGES", "8"))       # 可按店铺体量调大，如 8 => 2000 条
+
+    # —— 意大利常见“品类/前缀”词；在标题最前面时会尝试剥离
+    CATEGORY_PREFIXES = {
+        "coordinato", "abito", "gonna", "pantalone", "vestito",
+        "tuta", "maglia", "maglione", "top", "camicia", "camicetta",
+        "giacca", "cappotto", "felpa", "jeans", "shorts", "piumino",
+        "cardigan", "salopette", "body", "leggings", "scarpa",
+        "sandalo", "stivale", "borsa", "cintura", "set", "completo"
+    }
+
+    # 1) 规范化（保留拉丁扩展和空格/连字符）
     def normalize(s: str) -> str:
         s = s.strip()
         s = s.replace("“", "").replace("”", "").replace("‘", "").replace("’", "")
         s = s.replace('"', "").replace("'", "")
-        s = re.sub(r"[^0-9A-Za-zÀ-ÿ\s\-]", " ", s)  # 仅字母数字/空格/连字符（含重音）
+        s = re.sub(r"[^0-9A-Za-zÀ-ÿ\s\-]", " ", s)
         s = re.sub(r"\s+", " ", s)
         return s.strip()
 
-# 候选查询词（原文/清洗/前2-3词 + 尾部2/3词 + 去问法前缀）
-candidates: List[str] = []
-if q_raw:
-    candidates.append(q_raw)
+    # 2) 从问句生成“很可能是品名”的候选集合
+    candidates: list[str] = []
+    if q_raw:
+        candidates.append(q_raw)
 
-    norm = normalize(q_raw)              # 例："quanto costa coordinato anahi"
-    candidates.append(norm)
+        norm = normalize(q_raw)       # 如： "quanto costa coordinato anahi"
+        candidates.append(norm)
 
-    parts = norm.split()
+        parts = norm.split()
 
-    # 前 2/3 词（原逻辑）
-    if len(parts) >= 2:
-        candidates.append(" ".join(parts[:2]))
-    if len(parts) >= 3:
-        candidates.append(" ".join(parts[:3]))
+        # —— 前 2 / 3 词
+        if len(parts) >= 2:
+            candidates.append(" ".join(parts[:2]))
+        if len(parts) >= 3:
+            candidates.append(" ".join(parts[:3]))
 
-    # ✅ 尾部 2/3 词（新增）——常见真实商品名在句尾
-    if len(parts) >= 2:
-        candidates.append(" ".join(parts[-2:]))   # 如 "coordinato anahi"
-    if len(parts) >= 3:
-        candidates.append(" ".join(parts[-3:]))
+        # —— 尾部 2 / 3 词（真实商品名常在句尾）
+        if len(parts) >= 2:
+            candidates.append(" ".join(parts[-2:]))      # "coordinato anahi"
+        if len(parts) >= 3:
+            candidates.append(" ".join(parts[-3:]))
 
-    # ✅ 去掉常见问法前缀后再取尾部 2/3 词（新增）
-    import re
-    prefix_re = re.compile(
-        r"^(quanto\s+costa|prezzo|quanto\s+viene|costa|price|prezzi|il\s+prezzo\s+di)\b",
-        flags=re.IGNORECASE
-    )
-    tail = prefix_re.sub("", norm).strip()        # "coordinato anahi"
-    if tail:
-        candidates.append(tail)
-        tparts = tail.split()
-        if len(tparts) >= 2:
-            candidates.append(" ".join(tparts[-2:]))
-        if len(tparts) >= 3:
-            candidates.append(" ".join(tparts[-3:]))
+        # —— 去掉常见问法前缀后再取尾部 2 / 3 词
+        prefix_re = re.compile(
+            r"^(quanto\s+costa|prezzo|quanto\s+viene|costa|price|prezzi|il\s+prezzo\s+di)\b",
+            flags=re.IGNORECASE
+        )
+        tail = prefix_re.sub("", norm).strip()           # "coordinato anahi"
+        if tail:
+            candidates.append(tail)
+            tparts = tail.split()
+            if len(tparts) >= 2:
+                candidates.append(" ".join(tparts[-2:]))
+            if len(tparts) >= 3:
+                candidates.append(" ".join(tparts[-3:]))
 
-# 去重
-cand_list: List[str] = []
-seen = set()
-for c in candidates:
-    c2 = c.strip().lower()
-    if c2 and c2 not in seen:
-        seen.add(c2)
-        
-    items: List[Dict[str, Any]] = []
+        # —— 如果句子以“品类前缀 + 名称”，生成“去前缀”的候选
+        def strip_category_prefix(s: str) -> str:
+            ps = s.lower().split()
+            if ps and ps[0] in CATEGORY_PREFIXES:
+                return " ".join(ps[1:])
+            return s
+
+        for c in list(candidates):
+            c2 = strip_category_prefix(c)
+            if c2 and c2 != c:
+                candidates.append(c2)
+
+    # 去重小写化
+    cand_list: list[str] = []
+    seen = set()
+    for c in candidates:
+        c2 = c.strip().lower()
+        if c2 and c2 not in seen:
+            seen.add(c2)
+            cand_list.append(c2)
+
+    # ======== 命中与排序 ========
+    items: list[Dict[str, Any]] = []
     seen_variants: set[int] = set()
 
-    def push_item(p: Dict[str, Any], v: Dict[str, Any]):
+    def push_item(p: Dict[str, Any], v: Dict[str, Any], score: float):
+        """合并去重 + 简单打分排序（分数越小越好）"""
         try:
             key = int(v["id"])
         except Exception:
@@ -148,7 +138,9 @@ for c in candidates:
         if key in seen_variants:
             return
         seen_variants.add(key)
+
         items.append({
+            "_score": score,
             "product_id": p.get("id"),
             "variant_id": v.get("id"),
             "title": p.get("title"),
@@ -161,70 +153,119 @@ for c in candidates:
             "url": f"{PUBLIC_STORE_URL}/products/{p.get('handle','')}" if PUBLIC_STORE_URL else None
         })
 
-    # 0) 变体ID直查
+    def score_match(title_l: str, sku_l: str) -> float:
+        """
+        简单评分：
+        - 任何一个候选 q 完全包含在 title 中：score = 0
+        - token 交集 >= 2：score = 1
+        - sku 命中：score = 0.5
+        - 否则：+inf
+        """
+        best = inf
+        title_tokens = set(title_l.split())
+        for q in cand_list:
+            if q in title_l:
+                best = min(best, 0.0)
+            else:
+                q_tokens = set(q.split())
+                if len(q_tokens) >= 2 and len(title_tokens & q_tokens) >= 2:
+                    best = min(best, 1.0)
+            if q and q in sku_l:
+                best = min(best, 0.5)
+        return best
+
+    # ===== 0) 变体ID直查（优先、极快）
     if q_raw.isdigit():
         try:
             v = shopify_request(f"/variants/{q_raw}.json").get("variant")
             if v:
                 p = shopify_request(f"/products/{v['product_id']}.json").get("product", {})
                 if p:
-                    push_item(p, v)
+                    t_l = (p.get("title") or "").lower()
+                    s_l = (v.get("sku") or "").lower()
+                    push_item(p, v, score_match(t_l, s_l))
         except Exception:
             pass
         if len(items) >= limit:
-            return {"items": items[:limit]}
+            items.sort(key=lambda it: it["_score"])
+            return {"items": [ {k:v for k,v in it.items() if k!="_score"} for it in items[:limit] ]}
 
-    # 1) 精确 SKU（对每个候选词都试）
+    # ===== 1) SKU 精确查（对每个候选词都试）
     for q in cand_list:
         try:
             vjson = shopify_request("/variants.json", params={"sku": q, "limit": 50})
             for v in vjson.get("variants", []):
                 p = shopify_request(f"/products/{v['product_id']}.json").get("product", {})
                 if p:
-                    push_item(p, v)
+                    t_l = (p.get("title") or "").lower()
+                    s_l = (v.get("sku") or "").lower()
+                    push_item(p, v, score_match(t_l, s_l))
                     if len(items) >= limit:
-                        return {"items": items[:limit]}
+                        items.sort(key=lambda it: it["_score"])
+                        return {"items": [ {k:v for k,v in it.items() if k!="_score"} for it in items[:limit] ]}
         except Exception:
             pass
 
-    # 2) 标题精确（Shopify 按 title 过滤）
+    # ===== 2) 标题精确参数（Shopify 的 title= 并非全文检索，但先试试）
     for q in cand_list:
         try:
             by_title = shopify_request("/products.json", params={"title": q, "limit": 50}).get("products", [])
             for p in by_title:
                 v = (p.get("variants") or [{}])[0]
                 if v and v.get("id"):
-                    push_item(p, v)
+                    t_l = (p.get("title") or "").lower()
+                    s_l = (v.get("sku") or "").lower()
+                    push_item(p, v, score_match(t_l, s_l))
                     if len(items) >= limit:
-                        return {"items": items[:limit]}
+                        items.sort(key=lambda it: it["_score"])
+                        return {"items": [ {k:v for k,v in it.items() if k!="_score"} for it in items[:limit] ]}
         except Exception:
             pass
 
-    # 3) 兜底包含（title 或 sku 包含任一候选）
-    try:
-        products = shopify_request("/products.json", params={"limit": 250}).get("products", [])
-        for p in products:
-            title_l = (p.get("title") or "").lower()
-            hit = any(q in title_l for q in cand_list if q)
-            chosen = None
-            if not hit:
-                for v in p.get("variants", []):
-                    sku_l = (v.get("sku") or "").lower()
-                    if any(q in sku_l for q in cand_list if q):
-                        chosen = v
-                        hit = True
-                        break
-            if hit:
-                v = chosen or (p.get("variants") or [{}])[0]
-                if v and v.get("id"):
-                    push_item(p, v)
-                    if len(items) >= limit:
-                        break
-    except Exception:
-        pass
+    # ===== 3) 大量商品的“分页兜底包含匹配” =====
+    since_id = 0
+    pages = 0
+    while pages < MAX_PAGES:
+        try:
+            page = shopify_request("/products.json", params={
+                "limit": PAGE_SIZE,
+                "since_id": since_id,     # 递增 id 分页
+            }).get("products", [])
+        except Exception:
+            break
 
-    return {"items": items[:limit]}
+        if not page:
+            break
 
+        for p in page:
+            v_list = p.get("variants") or []
+            if not v_list:
+                continue
+            # 用第一个变体代表这个商品（或也可都压入，但会占用配额）
+            v = v_list[0]
+            t_l = (p.get("title") or "").lower()
+            s_l = (v.get("sku") or "").lower()
+
+            sc = score_match(t_l, s_l)
+            if sc < inf:
+                push_item(p, v, sc)
+                # 小优化：有足够高质量命中可提前结束
+                if len(items) >= limit and sc <= 0.5:
+                    break
+
+            since_id = max(since_id, int(p.get("id", since_id)))
+
+        pages += 1
+        # 若这一页数量不足 PAGE_SIZE，说明已无更多
+        if len(page) < PAGE_SIZE:
+            break
+        # 小优化：有足够结果且都很优，就可以收手
+        if len(items) >= limit and min(it["_score"] for it in items) <= 0.5:
+            break
+
+    # 排序 + 截断 + 去掉内部字段
+    items.sort(key=lambda it: it["_score"])
+    return {"items": [ {k:v for k,v in it.items() if k!="_score"} for it in items[:limit] ]}
 
 # ============== Order Create ==============
 @app.post("/order.create")
