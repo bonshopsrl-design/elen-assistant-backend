@@ -22,26 +22,14 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ASSISTANT_ID = os.getenv("ASSISTANT_ID")
 OPENAI_PROJECT = os.getenv("OPENAI_PROJECT")  # optional
 
-# 可调参（覆盖默认）
-PAGE_SIZE_DEFAULT = int(os.getenv("LOOKUP_PAGE_SIZE", "250"))   # 1~250
-MAX_PAGES_DEFAULT = int(os.getenv("LOOKUP_MAX_PAGES", "8"))     # 例如 8 => 最多约 2000 件（250*8）
+# 查询调参（可在 Render 环境变量覆盖）
+PAGE_SIZE_DEFAULT = int(os.getenv("LOOKUP_PAGE_SIZE", "250"))         # 1~250
+MAX_PAGES_DEFAULT = int(os.getenv("LOOKUP_MAX_PAGES", "8"))           # 兜底旧参数（仍保留）
+HARD_MAX_PAGES_DEFAULT = int(os.getenv("LOOKUP_HARD_MAX_PAGES", "120"))
+PUBLISHED_STATUS_DEFAULT = os.getenv("LOOKUP_PUBLISHED_STATUS", "published")  # "published"/"any"/"unpublished"
+LOOKUP_DEBUG = os.getenv("LOOKUP_DEBUG", "0") == "1"
 
 app = FastAPI(title="ELEN Assistant Backend", version="1.0.0")
-
-
-# ============== Shopify helper ==============
-def shopify_request(path: str, method: str = "GET", payload=None, params=None):
-    if not SHOP_URL or not ACCESS_TOKEN:
-        raise HTTPException(500, "SHOP_URL or ACCESS_TOKEN not configured")
-    url = f"https://{SHOP_URL}/admin/api/2025-10{path}"
-    headers = {
-        "X-Shopify-Access-Token": ACCESS_TOKEN,
-        "Content-Type": "application/json",
-    }
-    r = requests.request(method, url, headers=headers, json=payload, params=params, timeout=30)
-    if r.status_code >= 300:
-        raise HTTPException(status_code=r.status_code, detail=r.text)
-    return r.json()
 
 
 # ============== Models ==============
@@ -82,19 +70,38 @@ class OrderCreateIn(BaseModel):
     notes: str | None = "ordine creato dal BOT"
 
 
-# ============== Price Lookup (分页 + 智能匹配 + 礼品卡过滤/降权) ==============
+# ============== Shopify helper ==============
+def shopify_request(path: str, method: str = "GET", payload=None, params=None):
+    if not SHOP_URL or not ACCESS_TOKEN:
+        raise HTTPException(500, "SHOP_URL or ACCESS_TOKEN not configured")
+    url = f"https://{SHOP_URL}/admin/api/2025-10{path}"
+    headers = {
+        "X-Shopify-Access-Token": ACCESS_TOKEN,
+        "Content-Type": "application/json",
+    }
+    r = requests.request(method, url, headers=headers, json=payload, params=params, timeout=30)
+    if r.status_code >= 300:
+        raise HTTPException(status_code=r.status_code, detail=r.text)
+    return r.json()
+
+
+# ============== Price Lookup ==============
 @app.post("/price.lookup")
 def price_lookup(body: PriceLookupIn):
+    """
+    - 支持：variant_id 直查、SKU 精确、标题精确、分页兜底（遍历所有页 & 所有变体 & 选项参与匹配）
+    - 处理：类目前缀剥离（Coordinato/Abito/Gonna/...）、礼品卡过滤/降权
+    """
     import re
 
     q_raw = (body.query or "").strip()
     limit = max(1, min(20, body.limit or 5))
 
-    # Shopify 允许一次最多 250；分页以 since_id 方式推进
     PAGE_SIZE = min(250, max(1, PAGE_SIZE_DEFAULT))
-    MAX_PAGES = max(1, MAX_PAGES_DEFAULT)
+    HARD_MAX_PAGES = max(1, HARD_MAX_PAGES_DEFAULT)
+    PUBLISHED_STATUS = PUBLISHED_STATUS_DEFAULT  # 可设 "any"
 
-    # 常见“品类/前缀”，在标题最前面时会尝试剥离，提升召回（如 "Coordinato Anahi" -> "Anahi" 也会尝试）
+    # —— 意大利常见“品类/前缀”词；在标题最前面时会尝试剥离
     CATEGORY_PREFIXES = {
         "coordinato", "abito", "gonna", "pantalone", "vestito",
         "tuta", "maglia", "maglione", "top", "camicia", "camicetta",
@@ -103,7 +110,7 @@ def price_lookup(body: PriceLookupIn):
         "sandalo", "stivale", "borsa", "cintura", "set", "completo"
     }
 
-    # Gift Card 相关词（标题与用户输入）
+    # —— 礼品卡识别（标题与查询）
     GIFT_TOKENS_IN_TITLE = ("gift card", "giftcard", "buono", "voucher")
     GIFT_TOKENS_IN_QUERY = ("gift", "card", "giftcard", "buono", "voucher")
 
@@ -113,7 +120,7 @@ def price_lookup(body: PriceLookupIn):
     def query_is_gift_related(cand_list: list[str]) -> bool:
         return any(any(tok in q for tok in GIFT_TOKENS_IN_QUERY) for q in cand_list)
 
-    # 1) 规范化（保留拉丁扩展与空格/连字符）
+    # —— 规范化
     def normalize(s: str) -> str:
         s = s.strip()
         s = s.replace("“", "").replace("”", "").replace("‘", "").replace("’", "")
@@ -122,13 +129,12 @@ def price_lookup(body: PriceLookupIn):
         s = re.sub(r"\s+", " ", s)
         return s.strip()
 
-    # 2) 生成候选查询词
+    # —— 生成候选查询词
     candidates: list[str] = []
     if q_raw:
         candidates.append(q_raw)
         norm = normalize(q_raw)
         candidates.append(norm)
-
         parts = norm.split()
 
         # 前 2 / 3 词
@@ -137,13 +143,13 @@ def price_lookup(body: PriceLookupIn):
         if len(parts) >= 3:
             candidates.append(" ".join(parts[:3]))
 
-        # 尾部 2 / 3 词（商品名常在句尾）
+        # 尾部 2 / 3 词
         if len(parts) >= 2:
             candidates.append(" ".join(parts[-2:]))
         if len(parts) >= 3:
             candidates.append(" ".join(parts[-3:]))
 
-        # 去掉“问句前缀”后的尾部 2 / 3 词
+        # 去掉问句前缀（quanto costa/prezzo/...）
         prefix_re = re.compile(
             r"^(quanto\s+costa|prezzo|quanto\s+viene|costa|price|prezzi|il\s+prezzo\s+di)\b",
             flags=re.IGNORECASE
@@ -157,7 +163,7 @@ def price_lookup(body: PriceLookupIn):
             if len(tparts) >= 3:
                 candidates.append(" ".join(tparts[-3:]))
 
-        # 剥离类目前缀（如 "coordinato anahi" -> "anahi" 也加入候选）
+        # 剥离类目前缀
         def strip_category_prefix(s: str) -> str:
             ps = s.lower().split()
             if ps and ps[0] in CATEGORY_PREFIXES:
@@ -169,7 +175,7 @@ def price_lookup(body: PriceLookupIn):
             if c2 and c2 != c:
                 candidates.append(c2)
 
-    # 去重小写化
+    # 去重
     cand_list: list[str] = []
     seen_c = set()
     for c in candidates:
@@ -178,13 +184,15 @@ def price_lookup(body: PriceLookupIn):
             seen_c.add(c2)
             cand_list.append(c2)
 
-    # 结果与去重
+    if LOOKUP_DEBUG:
+        print(f"[lookup] q_raw={q_raw!r} cand_list={cand_list}")
+
+    # 结果集合
     items: list[Dict[str, Any]] = []
     seen_variants: set[int] = set()
-    seen_products: set[int] = set()  # 如果想同商品只展示一次，可启用
+    seen_products: set[int] = set()  # 同商品折叠（保留第一命中）
 
     def push_item(p: Dict[str, Any], v: Dict[str, Any], score: float):
-        # 同商品折叠（可选：取消注释关闭折叠）
         pid = int(p.get("id"))
         if pid in seen_products:
             return
@@ -214,12 +222,12 @@ def price_lookup(body: PriceLookupIn):
 
     def score_match(title_l: str, sku_l: str, cand_list_: list[str]) -> float:
         """
-        简单评分：
-        - 任何一个候选 q 完全包含在 title 中：score = 0
-        - token 交集 >= 2：score = 1
-        - sku 命中：score = 0.5
-        - 否则：+inf
-        同时对礼品卡进行惩罚（除非用户明确在找礼品卡）
+        简单双通道评分（越小越好）：
+        - 候选 q 完全包含在 title 中：0.0
+        - token 交集 >= 2：1.0
+        - sku 包含任一候选：0.5
+        - 礼品卡在非礼品查询时 +5 惩罚
+        - 其他：+inf
         """
         best = inf
         title_tokens = set(title_l.split())
@@ -250,10 +258,7 @@ def price_lookup(body: PriceLookupIn):
                     t_l = (p.get("title") or "").lower()
                     s_l = (v.get("sku") or "").lower()
                     sc = score_match(t_l, s_l, cand_list)
-                    if is_gift_card_title(t_l) and not query_is_gift_related(cand_list):
-                        # 变体直查也做一次过滤（非礼品查询且礼品标题，直接不返回）
-                        pass
-                    else:
+                    if not (is_gift_card_title(t_l) and not query_is_gift_related(cand_list)):
                         push_item(p, v, sc)
         except Exception:
             pass
@@ -270,11 +275,8 @@ def price_lookup(body: PriceLookupIn):
                 if p:
                     t_l = (p.get("title") or "").lower()
                     s_l = (v.get("sku") or "").lower()
-
-                    # 非礼品查询时，直接过滤礼品卡
                     if is_gift_card_title(t_l) and not query_is_gift_related(cand_list):
                         continue
-
                     sc = score_match(t_l, s_l, cand_list)
                     push_item(p, v, sc)
                     if len(items) >= limit:
@@ -283,19 +285,19 @@ def price_lookup(body: PriceLookupIn):
         except Exception:
             pass
 
-    # ===== 2) 标题精确参数
+    # ===== 2) 标题精确参数（并不是真全文，但很快）
     for q in cand_list:
         try:
-            by_title = shopify_request("/products.json", params={"title": q, "limit": 50}).get("products", [])
+            by_title = shopify_request("/products.json", params={
+                "title": q, "limit": 50, "published_status": PUBLISHED_STATUS
+            }).get("products", [])
             for p in by_title:
                 v = (p.get("variants") or [{}])[0]
                 if v and v.get("id"):
                     t_l = (p.get("title") or "").lower()
                     s_l = (v.get("sku") or "").lower()
-
                     if is_gift_card_title(t_l) and not query_is_gift_related(cand_list):
                         continue
-
                     sc = score_match(t_l, s_l, cand_list)
                     push_item(p, v, sc)
                     if len(items) >= limit:
@@ -304,82 +306,84 @@ def price_lookup(body: PriceLookupIn):
         except Exception:
             pass
 
-# ===== 3) 分页兜底（全量翻页到没有更多 or 达到硬上限）=====
-since_id = 0
-pages = 0
-gift_query = query_is_gift_related(cand_list)
+    # ===== 3) 分页兜底（全量翻页 + 遍历所有变体 + 选项参与匹配）=====
+    def variant_label(p: dict, v: dict) -> str:
+        """把 标题 + 选项值 拼起来参与匹配，例如 'Vestito Josephine Rosso XS'。"""
+        title = (p.get("title") or "").strip()
+        opts = []
+        for k in ("option1", "option2", "option3"):
+            val = (v.get(k) or "").strip()
+            if val:
+                opts.append(val)
+        if opts:
+            return (title + " " + " ".join(opts)).strip()
+        return title
 
-# 可在环境变量里调大或调小；例如 100 表示最多扫 100 页（~ 100 * PAGE_SIZE 件商品）
-HARD_MAX_PAGES = int(os.getenv("LOOKUP_HARD_MAX_PAGES", "100"))
+    since_id = 0
+    pages = 0
+    gift_query = query_is_gift_related(cand_list)
 
-while pages < HARD_MAX_PAGES:
-    try:
-        page = shopify_request("/products.json", params={
-            "limit": PAGE_SIZE,
-            "since_id": since_id,
-        }).get("products", [])
-    except Exception:
-        break
-
-    if not page:
-        break
-
-    # 记录本页里最好的命中，用来决定是否提前结束
-    page_best_score = float("inf")
-
-    for p in page:
-        v_list = p.get("variants") or []
-        if not v_list:
-            # 也要推进 since_id，避免卡住
-            try:
-                pid = int(p.get("id", 0))
-                if pid > since_id:
-                    since_id = pid
-            except Exception:
-                pass
-            continue
-
-        # 取一个代表变体（需要也可遍历所有变体）
-        v = v_list[0]
-        t_l = (p.get("title") or "").lower()
-        s_l = (v.get("sku") or "").lower()
-
-        # 非礼品查询时过滤礼品卡
-        if is_gift_card_title(t_l) and not gift_query:
-            try:
-                pid = int(p.get("id", 0))
-                if pid > since_id:
-                    since_id = pid
-            except Exception:
-                pass
-            continue
-
-        sc = score_match(t_l, s_l, cand_list)
-        if sc < float("inf"):
-            page_best_score = min(page_best_score, sc)
-            push_item(p, v, sc)
-
-        # 无论命中与否，都推进 since_id（用 id 递增分页）
+    while pages < HARD_MAX_PAGES:
         try:
-            pid = int(p.get("id", 0))
+            page = shopify_request("/products.json", params={
+                "limit": PAGE_SIZE,
+                "since_id": since_id,
+                "published_status": PUBLISHED_STATUS,
+            }).get("products", [])
+        except Exception:
+            break
+
+        if not page:
+            break
+
+        page_best_score = float("inf")
+
+        for p in page:
+            try:
+                pid = int(p.get("id", 0))
+            except Exception:
+                pid = 0
+
+            v_list = p.get("variants") or []
+            if not v_list:
+                if pid > since_id:
+                    since_id = pid
+                continue
+
+            # 遍历所有变体
+            for v in v_list:
+                t_full = variant_label(p, v).lower()  # 标题+选项
+                sku_l = (v.get("sku") or "").lower()
+
+                # 非礼品查询时过滤礼品卡
+                if is_gift_card_title(t_full) and not gift_query:
+                    continue
+
+                sc = score_match(t_full, sku_l, cand_list)
+                if sc < float("inf"):
+                    page_best_score = min(page_best_score, sc)
+                    push_item(p, v, sc)
+
+            # 推进 since_id
             if pid > since_id:
                 since_id = pid
-        except Exception:
-            pass
 
-    pages += 1
+        pages += 1
 
-    # 如果这一页数量不足 PAGE_SIZE，说明已无更多
-    if len(page) < PAGE_SIZE:
-        break
+        # 页数据不足说明到头
+        if len(page) < PAGE_SIZE:
+            break
 
-    # 如果已经凑够 limit，且本页也没有出现“较好”的命中（>0.5），可以提前结束
-    if len(items) >= limit and page_best_score > 0.5:
-        break
+        # 如果已经凑够结果且本页没有较好命中，可提前结束
+        if len(items) >= limit and page_best_score > 0.6:
+            break
 
-# 排序 + 截断 + 去掉内部字段
-items.sort(key=lambda it: it["_score"])
-return {"items": [{k: v for k, v in it.items() if k != "_score"} for it in items[:limit]]}
+        if LOOKUP_DEBUG:
+            print(f"[lookup] page#{pages} size={len(page)} since_id={since_id} items={len(items)} best={page_best_score}")
+
+    # 排序 + 截断 + 去掉内部字段
+    items.sort(key=lambda it: it["_score"])
+    return {"items": [{k: v for k, v in it.items() if k != "_score"} for it in items[:limit]]}
 
 
 # ============== Order Create ==============
@@ -413,18 +417,37 @@ def order_create(body: OrderCreateIn):
 # ============== Peek products (debug) ==============
 @app.get("/products.peek")
 def products_peek(limit: int = 30):
-    js = shopify_request("/products.json", params={"limit": min(250, max(1, limit))})
-    out = []
-    for p in js.get("products", []):
-        first = (p.get("variants") or [{}])[0]
-        out.append({
-            "id": p.get("id"),
-            "title": p.get("title"),
-            "handle": p.get("handle"),
-            "first_variant_id": first.get("id"),
-            "first_variant_sku": first.get("sku"),
-            "price": first.get("price"),
-        })
+    out: list[dict] = []
+    PAGE_SIZE = min(250, max(1, limit))
+    since_id = 0
+    while len(out) < limit:
+        page = shopify_request("/products.json", params={
+            "limit": PAGE_SIZE,
+            "since_id": since_id,
+            "published_status": PUBLISHED_STATUS_DEFAULT,
+        }).get("products", [])
+        if not page:
+            break
+        for p in page:
+            first = (p.get("variants") or [{}])[0]
+            out.append({
+                "id": p.get("id"),
+                "title": p.get("title"),
+                "handle": p.get("handle"),
+                "first_variant_id": first.get("id"),
+                "first_variant_sku": first.get("sku"),
+                "price": first.get("price"),
+            })
+            try:
+                pid = int(p.get("id", 0))
+                if pid > since_id:
+                    since_id = pid
+            except Exception:
+                pass
+            if len(out) >= limit:
+                break
+        if len(page) < PAGE_SIZE:
+            break
     return {"products": out}
 
 
