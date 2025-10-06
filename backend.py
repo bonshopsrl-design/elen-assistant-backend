@@ -92,26 +92,51 @@ def price_lookup(body: PriceLookupIn):
         s = re.sub(r"\s+", " ", s)
         return s.strip()
 
-    # 候选查询词（原文/清洗/前2-3词）
-    candidates: List[str] = []
-    if q_raw:
-        candidates.append(q_raw)
-        norm = normalize(q_raw)
-        candidates.append(norm)
-        parts = norm.split()
-        if len(parts) >= 2:
-            candidates.append(" ".join(parts[:2]))
-        if len(parts) >= 3:
-            candidates.append(" ".join(parts[:3]))
+# 候选查询词（原文/清洗/前2-3词 + 尾部2/3词 + 去问法前缀）
+candidates: List[str] = []
+if q_raw:
+    candidates.append(q_raw)
 
-    cand_list: List[str] = []
-    seen = set()
-    for c in candidates:
-        c2 = c.lower()
-        if c2 and c2 not in seen:
-            seen.add(c2)
-            cand_list.append(c2)
+    norm = normalize(q_raw)              # 例："quanto costa coordinato anahi"
+    candidates.append(norm)
 
+    parts = norm.split()
+
+    # 前 2/3 词（原逻辑）
+    if len(parts) >= 2:
+        candidates.append(" ".join(parts[:2]))
+    if len(parts) >= 3:
+        candidates.append(" ".join(parts[:3]))
+
+    # ✅ 尾部 2/3 词（新增）——常见真实商品名在句尾
+    if len(parts) >= 2:
+        candidates.append(" ".join(parts[-2:]))   # 如 "coordinato anahi"
+    if len(parts) >= 3:
+        candidates.append(" ".join(parts[-3:]))
+
+    # ✅ 去掉常见问法前缀后再取尾部 2/3 词（新增）
+    import re
+    prefix_re = re.compile(
+        r"^(quanto\s+costa|prezzo|quanto\s+viene|costa|price|prezzi|il\s+prezzo\s+di)\b",
+        flags=re.IGNORECASE
+    )
+    tail = prefix_re.sub("", norm).strip()        # "coordinato anahi"
+    if tail:
+        candidates.append(tail)
+        tparts = tail.split()
+        if len(tparts) >= 2:
+            candidates.append(" ".join(tparts[-2:]))
+        if len(tparts) >= 3:
+            candidates.append(" ".join(tparts[-3:]))
+
+# 去重
+cand_list: List[str] = []
+seen = set()
+for c in candidates:
+    c2 = c.strip().lower()
+    if c2 and c2 not in seen:
+        seen.add(c2)
+        
     items: List[Dict[str, Any]] = []
     seen_variants: set[int] = set()
 
