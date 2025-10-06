@@ -304,58 +304,82 @@ def price_lookup(body: PriceLookupIn):
         except Exception:
             pass
 
-    # ===== 3) 分页兜底（since_id 向后翻页，扫描全店）
-    since_id = 0
-    pages = 0
-    gift_query = query_is_gift_related(cand_list)
+# ===== 3) 分页兜底（全量翻页到没有更多 or 达到硬上限）=====
+since_id = 0
+pages = 0
+gift_query = query_is_gift_related(cand_list)
 
-    while pages < MAX_PAGES:
-        try:
-            page = shopify_request("/products.json", params={
-                "limit": PAGE_SIZE,
-                "since_id": since_id,
-            }).get("products", [])
-        except Exception:
-            break
+# 可在环境变量里调大或调小；例如 100 表示最多扫 100 页（~ 100 * PAGE_SIZE 件商品）
+HARD_MAX_PAGES = int(os.getenv("LOOKUP_HARD_MAX_PAGES", "100"))
 
-        if not page:
-            break
+while pages < HARD_MAX_PAGES:
+    try:
+        page = shopify_request("/products.json", params={
+            "limit": PAGE_SIZE,
+            "since_id": since_id,
+        }).get("products", [])
+    except Exception:
+        break
 
-        for p in page:
-            v_list = p.get("variants") or []
-            if not v_list:
-                continue
+    if not page:
+        break
 
-            # 取一个代表变体（或者你也可以遍历所有变体）
-            v = v_list[0]
-            t_l = (p.get("title") or "").lower()
-            s_l = (v.get("sku") or "").lower()
+    # 记录本页里最好的命中，用来决定是否提前结束
+    page_best_score = float("inf")
 
-            # 非礼品查询时过滤礼品卡
-            if is_gift_card_title(t_l) and not gift_query:
-                continue
-
-            sc = score_match(t_l, s_l, cand_list)
-            if sc < inf:
-                push_item(p, v, sc)
-
-                # 有足够高质量结果可提前结束
-                if len(items) >= limit and sc <= 0.5:
-                    break
-
+    for p in page:
+        v_list = p.get("variants") or []
+        if not v_list:
+            # 也要推进 since_id，避免卡住
             try:
-                since_id = max(since_id, int(p.get("id", since_id)))
+                pid = int(p.get("id", 0))
+                if pid > since_id:
+                    since_id = pid
             except Exception:
                 pass
+            continue
 
-        pages += 1
-        if len(page) < PAGE_SIZE:
-            break
-        if len(items) >= limit and items and min(it["_score"] for it in items) <= 0.5:
-            break
+        # 取一个代表变体（需要也可遍历所有变体）
+        v = v_list[0]
+        t_l = (p.get("title") or "").lower()
+        s_l = (v.get("sku") or "").lower()
 
-    items.sort(key=lambda it: it["_score"])
-    return {"items": [{k: v for k, v in it.items() if k != "_score"} for it in items[:limit]]}
+        # 非礼品查询时过滤礼品卡
+        if is_gift_card_title(t_l) and not gift_query:
+            try:
+                pid = int(p.get("id", 0))
+                if pid > since_id:
+                    since_id = pid
+            except Exception:
+                pass
+            continue
+
+        sc = score_match(t_l, s_l, cand_list)
+        if sc < float("inf"):
+            page_best_score = min(page_best_score, sc)
+            push_item(p, v, sc)
+
+        # 无论命中与否，都推进 since_id（用 id 递增分页）
+        try:
+            pid = int(p.get("id", 0))
+            if pid > since_id:
+                since_id = pid
+        except Exception:
+            pass
+
+    pages += 1
+
+    # 如果这一页数量不足 PAGE_SIZE，说明已无更多
+    if len(page) < PAGE_SIZE:
+        break
+
+    # 如果已经凑够 limit，且本页也没有出现“较好”的命中（>0.5），可以提前结束
+    if len(items) >= limit and page_best_score > 0.5:
+        break
+
+# 排序 + 截断 + 去掉内部字段
+items.sort(key=lambda it: it["_score"])
+return {"items": [{k: v for k, v in it.items() if k != "_score"} for it in items[:limit]]}
 
 
 # ============== Order Create ==============
